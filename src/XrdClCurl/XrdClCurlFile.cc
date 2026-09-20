@@ -1317,17 +1317,18 @@ File::PrefetchResponseHandler::PrefetchResponseHandler(
         if (lock && m_parent.m_prefetch_op) {
             // If continuing the prefetch operation fails, then the failure callback
             // will be invoked; the callback requires the mutex and hence we need to unlock it
-            // here to avoid a deadlock.
+            // here to avoid a deadlock.  Snapshot the op first so it cannot be reset out
+            // from under us while the lock is dropped.
+            auto op = m_parent.m_prefetch_op;
             lock->unlock();
-            if (!parent.m_prefetch_op->Continue(parent.m_prefetch_op, this, buffer, size)) {
-                lock->lock();
-                // As soon as we unlock the lock, another thread could have used finished the
-                // operation (which deletes the object); we must be careful to not touch the
-                // object (reference m_*) in the meantime.
-                if (parent.m_last_prefetch_handler == this)
-                    parent.m_last_prefetch_handler = nullptr;
-                throw std::runtime_error("Failed to continue prefetch operation");
-            }
+            // Continue() owns the completion either way.  On failure it delivers the error
+            // to this handler, whose HandleResponse() retires the tail pointer, resubmits
+            // any successor that was appended while the lock was dropped, and destroys this
+            // object.  So there is nothing left to clean up here and we must not touch
+            // `this`: adjusting the tail pointer would undo that cleanup, and throwing
+            // would free the object a second time and report a synchronous error for a
+            // read whose handler has already been invoked.
+            op->Continue(op, this, buffer, size);
         }
     }
 }
@@ -1375,6 +1376,15 @@ File::PrefetchResponseHandler::HandleResponse(XrdCl::XRootDStatus *status, XrdCl
         }
 
         next = m_next;
+        // Retire the tail pointer in the SAME critical section that consumes m_next.
+        // These two pieces of state must be updated atomically with respect to an
+        // arriving Read: if the tail is retired later, a Read that lands in between
+        // observes a stale tail, links itself onto the m_next we have already consumed
+        // instead of continuing the operation itself, and is never invoked -- leaving
+        // the caller blocked forever on a read that reported success.
+        if (parent_alive && !next && parent->m_last_prefetch_handler == this) {
+            parent->m_last_prefetch_handler = nullptr;
+        }
         // Snapshot the prefetch op while the parent is still alive; we will use it
         // outside the lock to continue the next handler in the chain.
         if (parent_alive) {
@@ -1400,9 +1410,10 @@ File::PrefetchResponseHandler::HandleResponse(XrdCl::XRootDStatus *status, XrdCl
         std::unique_lock lock(m_default_handler->m_prefetch_mutex);
         File *parent = m_default_handler->GetFileLocked();
         if (parent) {
-            if (parent->m_last_prefetch_handler == this) {
-                parent->m_last_prefetch_handler = nullptr;
-            }
+            // Note: m_last_prefetch_handler was retired above, in the same critical
+            // section that consumed m_next.  Do not retire it here as well: by now it
+            // may legitimately point at a new head handler installed by a Read that
+            // arrived after that section, and clearing it would orphan that chain.
             if (!status || !status->IsOK()) {
                 parent->m_prefetch_op.reset();
                 m_default_handler->m_prefetch_enabled = false;

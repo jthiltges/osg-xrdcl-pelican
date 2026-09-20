@@ -335,8 +335,10 @@ private:
         //   constructor is called.
         // - `timeout`: The timeout for the prefetch operation.
         //
-        // The constructor can throw a std::runtime_exception if the handler would have
-        // continued an ongoing prefetch operation but it failed to submit it.
+        // The constructor does not throw.  If it continues an ongoing prefetch operation
+        // and the submission fails, Continue() delivers the failure through this handler,
+        // which completes the read (and any chained successors) and destroys itself; the
+        // caller must therefore not touch the returned pointer after construction.
         PrefetchResponseHandler(File &parent,
             off_t offset, size_t size, std::atomic<off_t> *prefetch_offset, char *buffer, XrdCl::ResponseHandler *handler,
             std::unique_lock<std::mutex> *lock, timeout_t timeout);
