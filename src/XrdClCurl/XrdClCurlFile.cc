@@ -1375,6 +1375,10 @@ File::PrefetchResponseHandler::HandleResponse(XrdCl::XRootDStatus *status, XrdCl
         }
 
         next = m_next;
+        // Retire the tail pointer in the same critical section that consumes m_next.
+        if (parent_alive && !next && parent->m_last_prefetch_handler == this) {
+            parent->m_last_prefetch_handler = nullptr;
+        }
         // Snapshot the prefetch op while the parent is still alive; we will use it
         // outside the lock to continue the next handler in the chain.
         if (parent_alive) {
@@ -1400,9 +1404,6 @@ File::PrefetchResponseHandler::HandleResponse(XrdCl::XRootDStatus *status, XrdCl
         std::unique_lock lock(m_default_handler->m_prefetch_mutex);
         File *parent = m_default_handler->GetFileLocked();
         if (parent) {
-            if (parent->m_last_prefetch_handler == this) {
-                parent->m_last_prefetch_handler = nullptr;
-            }
             if (!status || !status->IsOK()) {
                 parent->m_prefetch_op.reset();
                 m_default_handler->m_prefetch_enabled = false;
